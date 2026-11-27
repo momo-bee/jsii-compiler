@@ -40,6 +40,7 @@ import { isAllowedCovariantSubtype } from './type-analysis';
 import { compareUnionMembers, createTypeResolver, typeReferenceEqual, typeReferenceToString } from './type-reference';
 import { isBehavioralInterfaceType, isDataType, visitTypeReference } from './type-visitor';
 import { parentFqn } from './utils';
+import { Validator } from './validator';
 import { SHORT_VERSION, VERSION } from './version';
 import { parseWarningCodes, suppressInline } from './warnings';
 
@@ -306,79 +307,15 @@ export class Assembler {
     // Classic: the validator runs on the finished assembly, and only when the
     // assembler itself reported no error.
     if (!this._diagnostics.some((d) => d.category === DiagnosticCategory.Error)) {
-      this._validateNames(assembly);
-      this._validateTypeReferences(assembly);
+      const validator = new Validator(this.options.projectInfo, assembly, {
+        nodeOf: (element) => this.relatedNodes.get(element),
+        syntaxKind: this.ts.SyntaxKind,
+        create: (code, node, ...args) => this._createDiagnostic(code, node, ...args),
+        location: (node) => this._diagnosticLocation(node),
+      });
+      this._diagnostics.push(...validator.emit().diagnostics);
     }
     return assembly;
-  }
-
-  /**
-   * Classic validator `_allTypeReferencesAreValid`: every named type the assembly refers to exists, in this assembly
-   * (JSII3000) or in a dependency (JSII9000, JSII9001).
-   */
-  private _validateTypeReferences(assembly: spec.Assembly): void {
-    const { SyntaxKind } = this.ts;
-    const refs: Array<{ fqn: string; node: any }> = [];
-    const collect = (type: spec.TypeReference | undefined, node: any): void => {
-      if (type == null) {
-        return;
-      }
-      if (spec.isNamedTypeReference(type)) {
-        refs.push({ fqn: type.fqn, node });
-      } else if (spec.isCollectionTypeReference(type)) {
-        collect(type.collection.elementtype, node);
-      } else if (spec.isUnionTypeReference(type)) {
-        for (const t of type.union.types) {
-          collect(t, node);
-        }
-      }
-    };
-    const types = Object.values(assembly.types ?? {}).filter(spec.isClassOrInterfaceType);
-    for (const type of types) {
-      const decl = this.relatedNodes.get(type);
-      const clause = (token: number) => (decl?.heritageClauses ?? []).find((hc: any) => hc.token === token);
-      if (spec.isClassType(type)) {
-        if (type.base) {
-          refs.push({ fqn: type.base, node: clause(SyntaxKind.ExtendsKeyword)?.types[0] });
-        }
-        for (const param of type.initializer?.parameters ?? []) {
-          collect(param.type, this.relatedNodes.get(param)?.type);
-        }
-      }
-      for (const iface of type.interfaces ?? []) {
-        // As in main: the clause looked up is the other kind's (`implements` for an interface).
-        const token = spec.isInterfaceType(type) ? SyntaxKind.ImplementsKeyword : SyntaxKind.ExtendsKeyword;
-        refs.push({ fqn: iface, node: clause(token) });
-      }
-    }
-    for (const type of types) {
-      for (const prop of type.properties ?? []) {
-        collect(prop.type, this.relatedNodes.get(prop)?.type);
-      }
-    }
-    for (const type of types) {
-      for (const method of type.methods ?? []) {
-        collect(method.returns?.type, this.relatedNodes.get(method)?.type);
-        for (const param of method.parameters ?? []) {
-          collect(param.type, this.relatedNodes.get(param)?.type);
-        }
-      }
-    }
-    for (const { fqn, node } of refs) {
-      const [assm] = fqn.split('.');
-      if (assm === assembly.name) {
-        if (!(fqn in (assembly.types ?? {}))) {
-          this._report(JsiiDiagnostic.JSII_3000_EXPORTED_API_USES_HIDDEN_TYPE, node, fqn);
-        }
-        continue;
-      }
-      const dependency = this.options.projectInfo.dependencyClosure.find((dep) => dep.name === assm);
-      if (dependency == null) {
-        this._report(JsiiDiagnostic.JSII_9000_UNKNOWN_MODULE, node, assm);
-      } else if (!(fqn in (dependency.types ?? {}))) {
-        this._report(JsiiDiagnostic.JSII_9001_TYPE_NOT_FOUND, node, { fqn });
-      }
-    }
   }
 
   // -------------------------------------------------------------------------
@@ -3845,11 +3782,21 @@ export class Assembler {
     node: any | undefined,
     ...args: Parameters<T>
   ): JsiiDiagnostic {
+    const diagnostic = this._createDiagnostic(code, node, ...args);
+    this._diagnostics.push(diagnostic);
+    return diagnostic;
+  }
+
+  /** The diagnostic `_report` reports, with inline suppressions applied, without reporting it. */
+  private _createDiagnostic<T extends DiagnosticMessageFormatter>(
+    code: Code<T>,
+    node: any | undefined,
+    ...args: Parameters<T>
+  ): JsiiDiagnostic {
     const diagnostic = code.create(this._diagnosticLocation(node), ...args);
     if (diagnostic.category === DiagnosticCategory.Warning && this._isSuppressed(node, diagnostic.jsiiCode)) {
       suppressInline(diagnostic);
     }
-    this._diagnostics.push(diagnostic);
     return diagnostic;
   }
 
@@ -3866,70 +3813,6 @@ export class Assembler {
   /** The name node of a declaration, or the declaration itself when it has none. */
   private _nameOrDeclaration(decl: any): any {
     return decl?.name ?? decl;
-  }
-
-  /**
-   * The naming conventions the classic validator checked on the finished
-   * assembly, in its order: enum members (JSII8001), then members (JSII8002),
-   * then static constants (JSII8003). Members are all methods, then all
-   * properties, type by type.
-   */
-  private _validateNames(assembly: spec.Assembly): void {
-    const types = Object.values(assembly.types ?? {});
-    const members = [
-      ...types.flatMap((type) =>
-        spec.isClassOrInterfaceType(type) ? (type.methods ?? []).map((member) => ({ member, type })) : [],
-      ),
-      ...types.flatMap((type) =>
-        spec.isClassOrInterfaceType(type)
-          ? (type.properties ?? []).map((member: spec.Property | spec.Method) => ({ member, type }))
-          : [],
-      ),
-    ];
-    const memberNameNode = (member: object) => this._nameOrDeclaration(this.relatedNodes.get(member));
-
-    for (const type of types) {
-      if (!spec.isEnumType(type)) {
-        continue;
-      }
-      const enumDecl = this.relatedNodes.get(type);
-      for (const member of type.members) {
-        if (member.name && !isConstantCase(member.name)) {
-          const memberDecl = (enumDecl?.members ?? []).find(
-            (m: any) => m.name?.kind === this.ts.SyntaxKind.Identifier && m.name.text === member.name,
-          );
-          this._report(
-            JsiiDiagnostic.JSII_8001_ALL_CAPS_ENUM_MEMBERS,
-            memberDecl?.name ?? this._nameOrDeclaration(enumDecl),
-            member.name,
-            type.fqn,
-          );
-        }
-      }
-    }
-
-    for (const { member, type } of members) {
-      if (member.static && (member as spec.Property).const) {
-        continue;
-      }
-      if (member.name && member.name !== Case.camel(member.name)) {
-        this._report(JsiiDiagnostic.JSII_8002_CAMEL_CASED_MEMBERS, memberNameNode(member), member.name, type.fqn);
-      }
-    }
-
-    for (const { member, type } of members) {
-      if (!member.static || !(member as spec.Property).const) {
-        continue;
-      }
-      if (
-        member.name &&
-        !isConstantCase(member.name) &&
-        member.name !== Case.pascal(member.name) &&
-        member.name !== Case.camel(member.name)
-      ) {
-        this._report(JsiiDiagnostic.JSII_8003_STATIC_CONST_CASING, memberNameNode(member), member.name, type.name);
-      }
-    }
   }
 
   private _warnAboutReservedWords(name: string, decl: any) {
@@ -4037,11 +3920,6 @@ const PROHIBITED_MEMBER_NAMES = ['build', 'equals', 'hashcode'];
 /** Port of the classic Assembler's `isProhibitedMemberName`. */
 function isProhibitedMemberName(name: string) {
   return PROHIBITED_MEMBER_NAMES.includes(name.toLowerCase());
-}
-
-/** Port of the classic validator's `isConstantCase`: only uppercase characters, digits and underscores. */
-function isConstantCase(x: string) {
-  return !/[^A-Z0-9_]/.exec(x);
 }
 
 /** Port of the classic Assembler's `noEmptyDict`. */
