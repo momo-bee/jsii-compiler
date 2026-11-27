@@ -2571,6 +2571,10 @@ export class Assembler {
   private _visitMethod(msym: any, decl: any, isStatic: boolean, jsiiType: any, declaringTypeDecl: any): any {
     const { SyntaxKind } = this.ts;
     const sig = this.checker.getSignatureFromDeclaration(decl);
+    if (!sig) {
+      this._report(JsiiDiagnostic.JSII_9004_UNABLE_TO_COMPUTE_SIGNATURE, decl, msym.name, jsiiType);
+      return undefined;
+    }
     if (!this._validateMemberName('method', msym, decl, jsiiType, declaringTypeDecl)) {
       return undefined;
     }

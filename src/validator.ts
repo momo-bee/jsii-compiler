@@ -15,6 +15,7 @@ import * as Case from './case';
 import { DiagnosticCategory } from './diagnostic';
 import { Code, DiagnosticLocation, DiagnosticMessageFormatter, JsiiDiagnostic } from './jsii-diagnostic';
 import { ProjectInfo } from './project-info';
+import { createTypeResolver } from './type-reference';
 
 export interface ValidationResult {
   readonly diagnostics: readonly JsiiDiagnostic[];
@@ -85,14 +86,15 @@ export type ValidationFunction = (
 
 function _defaultValidations(): ValidationFunction[] {
   // The classic order. Not ported yet: _inheritanceDoesNotChangeContracts (JSII5002 to JSII5010) after
-  // _allTypeReferencesAreValid, then _staticMembersAndNestedTypesMustNotSharePascalCaseName (JSII5020) and
-  // _abstractClassesMustImplementAllProperties (JSII5021).
+  // _allTypeReferencesAreValid.
   return [
     _enumMembersMustUserUpperSnakeCase,
     _memberNamesMustUseCamelCase,
     _staticConstantNamesMustUseUpperSnakeCase,
     _memberNamesMustNotLookLikeJavaGettersOrSetters,
     _allTypeReferencesAreValid,
+    _staticMembersAndNestedTypesMustNotSharePascalCaseName,
+    _abstractClassesMustImplementAllProperties,
   ];
 
   function _enumMembersMustUserUpperSnakeCase(
@@ -237,7 +239,9 @@ function _defaultValidations(): ValidationFunction[] {
         }
       }
       for (const iface of type.interfaces ?? []) {
-        // As in main: the clause looked up is the other kind's (`implements` for an interface).
+        // As in main: the clause looked up is the other kind's (`implements` for an interface), so the node is lost.
+        // @TODO(NEXT): main's validator has this bug (https://github.com/aws/jsii-compiler/issues/3109); after 7.1's
+        // first release, use the matching type of the `extends` (interface) or `implements` (class) clause.
         const token = spec.isInterfaceType(type) ? SyntaxKind.ImplementsKeyword : SyntaxKind.ExtendsKeyword;
         refs.push({ fqn: iface, node: clause(token) });
       }
@@ -268,6 +272,105 @@ function _defaultValidations(): ValidationFunction[] {
         report(validator, diagnostic, JsiiDiagnostic.JSII_9000_UNKNOWN_MODULE, node, assm);
       } else if (!(fqn in (dependency.types ?? {}))) {
         report(validator, diagnostic, JsiiDiagnostic.JSII_9001_TYPE_NOT_FOUND, node, { fqn });
+      }
+    }
+  }
+
+  /**
+   * A static member and a nested type of a type may not have the same PascalCased name (JSII5020), as Go uses that
+   * name for both. Moved here from the assembler (#3089).
+   */
+  function _staticMembersAndNestedTypesMustNotSharePascalCaseName(
+    validator: Validator,
+    assembly: spec.Assembly,
+    diagnostic: DiagnosticEmitter,
+  ) {
+    const { bindings } = validator;
+    for (const nestedType of Object.values(assembly.types ?? {})) {
+      if (nestedType.namespace == null) {
+        continue;
+      }
+      const nestingType = assembly.types![`${assembly.name}.${nestedType.namespace}`];
+      if (nestingType == null) {
+        continue;
+      }
+      const nestedTypeName = Case.pascal(nestedType.name);
+      const members: Array<spec.Property | spec.Method | spec.EnumMember> = spec.isClassOrInterfaceType(nestingType)
+        ? [
+            ...(nestingType.methods ?? []).filter((m) => m.static),
+            ...(nestingType.properties ?? []).filter((p) => p.static),
+          ]
+        : nestingType.members;
+      for (const member of members) {
+        const name = spec.isClassOrInterfaceType(nestingType) ? Case.pascal(member.name) : member.name;
+        if (name !== nestedTypeName) {
+          continue;
+        }
+        const node = spec.isClassOrInterfaceType(nestingType)
+          ? bindings.nodeOf(member)
+          : (bindings.nodeOf(nestingType)?.members ?? []).find((m: any) => m.name?.text === member.name);
+        report(
+          validator,
+          diagnostic,
+          JsiiDiagnostic.JSII_5020_STATIC_MEMBER_CONFLICTS_WITH_NESTED_TYPE,
+          node,
+          nestingType,
+          member,
+          nestedType,
+        ).addRelatedInformationIf(
+          bindings.location(bindings.nodeOf(nestedType)),
+          'This is the conflicting nested type declaration',
+        );
+      }
+    }
+  }
+
+  /**
+   * An abstract class declares every optional property of the interfaces it implements, at least as `abstract`
+   * (JSII5021); TypeScript already requires the others. Moved here from the assembler (#3089).
+   */
+  function _abstractClassesMustImplementAllProperties(
+    validator: Validator,
+    assembly: spec.Assembly,
+    diagnostic: DiagnosticEmitter,
+  ) {
+    const { bindings } = validator;
+    const _dereference = createTypeResolver(assembly, validator.projectInfo.dependencyClosure);
+    for (const type of Object.values(assembly.types ?? {})) {
+      if (!spec.isClassType(type) || !type.abstract) {
+        continue;
+      }
+      const classProps = new Set<string>();
+      for (let t: spec.Type | undefined = type; t != null && spec.isClassType(t); ) {
+        for (const prop of t.properties ?? []) {
+          classProps.add(prop.name);
+        }
+        t = t.base != null ? _dereference(t.base) : undefined;
+      }
+      const check = (interfaceFqn: string) => {
+        const intf = _dereference(interfaceFqn);
+        if (intf == null || !spec.isInterfaceType(intf)) {
+          return;
+        }
+        for (const prop of intf.properties ?? []) {
+          if (prop.optional && !classProps.has(prop.name)) {
+            report(
+              validator,
+              diagnostic,
+              JsiiDiagnostic.JSII_5021_ABSTRACT_CLASS_MISSING_PROP_IMPL,
+              bindings.nodeOf(type),
+              intf,
+              type,
+              prop.name,
+            ).addRelatedInformationIf(bindings.location(bindings.nodeOf(prop)), 'The implemented declaration is here.');
+          }
+        }
+        for (const extFqn of intf.interfaces ?? []) {
+          check(extFqn);
+        }
+      };
+      for (const implFqn of type.interfaces ?? []) {
+        check(implFqn);
       }
     }
   }
