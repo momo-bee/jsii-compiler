@@ -660,6 +660,18 @@ export class Assembler {
     }
   }
 
+  /** `checker.getTypeFromTypeNode` of each node, read in one batch; `undefined` when there is one node or the batch fails. */
+  private _typesFromTypeNodes(nodes: readonly any[]): any[] | undefined {
+    if (nodes.length < 2) {
+      return undefined;
+    }
+    try {
+      return this.project.api.batch(...[...nodes].map((n) => this.checker.getTypeFromTypeNode.gen(n)));
+    } catch {
+      return undefined;
+    }
+  }
+
   private _shouldStrip(sym: any, fqn: string): boolean {
     if (!this.stripDeprecated || !this._isDeprecated(sym)) {
       return false;
@@ -2966,8 +2978,10 @@ export class Assembler {
           refs.push(r);
         }
       };
-      for (const tn of un.types) {
-        const tt = this.checker.getTypeFromTypeNode(tn);
+      // One batch for the types of all members of the union, instead of a round trip per member.
+      const typesOfNodes = this._typesFromTypeNodes(un.types);
+      for (const [index, tn] of [...un.types].entries()) {
+        const tt = typesOfNodes != null ? typesOfNodes[index] : this.checker.getTypeFromTypeNode(tn);
         if (tt && tt.flags & (TypeFlags.Undefined | TypeFlags.Null)) {
           if (optionalOut) {
             optionalOut.optional = true;
