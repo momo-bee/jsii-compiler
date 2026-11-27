@@ -778,6 +778,41 @@ export class Assembler {
     for (let i = 0; i < all.length; i += PREFETCH_CHUNK) {
       this._prefetchDocs(all.slice(i, i + PREFETCH_CHUNK));
     }
+    this._prefetchUnionMemberTypes(all, new Set(decls.map((d) => d.getSourceFile?.()?.fileName)));
+  }
+
+  /**
+   * Read the type of each member of the union types written on the members (property types, return types and
+   * parameter types declared in the files of the exported types), in a few large batches. `_unionTypeReference`
+   * reads them one by one otherwise (aws-cdk-lib: 77k requests).
+   */
+  private _prefetchUnionMemberTypes(members: readonly any[], files: ReadonlySet<string | undefined>): void {
+    const { SyntaxKind } = this.ts;
+    const nodes: any[] = [];
+    const addUnion = (typeNode: any) => {
+      if (typeNode?.kind === SyntaxKind.UnionType) {
+        nodes.push(...typeNode.types);
+      }
+    };
+    for (const m of members) {
+      for (const handle of m.declarations ?? []) {
+        const decl = handle.resolve(this.project);
+        if (decl == null || !files.has(decl.getSourceFile?.()?.fileName)) {
+          continue;
+        }
+        addUnion(decl.type);
+        for (const p of decl.parameters ?? []) {
+          addUnion(p.type);
+        }
+      }
+    }
+    try {
+      for (let i = 0; i < nodes.length; i += PREFETCH_CHUNK) {
+        this.checker.getTypeFromTypeNode(nodes.slice(i, i + PREFETCH_CHUNK));
+      }
+    } catch {
+      // shortcut: a failed batch reads nothing more ahead; each type is then read when it is needed, as before.
+    }
   }
 
   private _shouldStrip(sym: any, fqn: string): boolean {

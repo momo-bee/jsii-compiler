@@ -208,7 +208,7 @@ export class CompilerHost {
     }
     return {
       program: project.program,
-      checker: withMemoizedTypeAtLocation(project.checker),
+      checker: withMemoizedTypes(project.checker, this.api),
       api: this.api,
       rootFileNames: project.parsedCommandLine.fileNames,
     };
@@ -232,24 +232,27 @@ export class CompilerHost {
 }
 
 /**
- * The checker, with `getTypeAtLocation(node)` sent to the TypeScript 7 process
- * once per node. Every call is a round trip, and the assembler asks for the type
- * of the same node many times (aws-cdk-lib: 238k calls for 28k nodes). The API
- * hands out one object per type id, so the cached answer is the object a new
- * call would return.
+ * The checker, with `getTypeAtLocation(node)` and `getTypeFromTypeNode(node)`
+ * sent to the TypeScript 7 process once per node. Every call is a round trip,
+ * and the assembler asks for the type of the same node many times (aws-cdk-lib:
+ * 238k `getTypeAtLocation` calls for 28k nodes). The API hands out one object
+ * per type id, so the cached answer is the object a new call would return. An
+ * array of nodes is read in one request (`getTypeFromTypeNode` has no array
+ * form of its own, so that is one batch).
  */
-function withMemoizedTypeAtLocation(checker: any): any {
+function withMemoizedTypes(checker: any, api: any): any {
   const types = new Map<string, any>();
   const getTypeAtLocation = (node: any) => {
     if (Array.isArray(node)) {
-      // An array of nodes is one request for the nodes not answered yet.
       if (node.some((n) => typeof n?.id !== 'string')) {
         return checker.getTypeAtLocation(node);
       }
       const missing = [...new Set(node.filter((n) => !types.has(n.id)))];
       if (missing.length > 0) {
         const fetched = checker.getTypeAtLocation(missing);
-        for (const [i, n] of missing.entries()) types.set(n.id, fetched[i]);
+        for (const [i, n] of missing.entries()) {
+          types.set(n.id, fetched[i]);
+        }
       }
       return node.map((n) => types.get(n.id));
     }
@@ -262,7 +265,33 @@ function withMemoizedTypeAtLocation(checker: any): any {
     }
     return types.get(id);
   };
+  const typesOfTypeNodes = new Map<string, any>();
+  const getTypeFromTypeNode = (node: any): any => {
+    if (Array.isArray(node)) {
+      const missing = [...new Set(node.filter((n) => typeof n?.id === 'string' && !typesOfTypeNodes.has(n.id)))];
+      if (missing.length > 0) {
+        const fetched: any[] = api.batch(...missing.map((n) => checker.getTypeFromTypeNode.gen(n)));
+        for (const [i, n] of missing.entries()) {
+          typesOfTypeNodes.set(n.id, fetched[i]);
+        }
+      }
+      return node.map((n) => getTypeFromTypeNode(n));
+    }
+    const id = node?.id;
+    if (typeof id !== 'string') {
+      return checker.getTypeFromTypeNode(node);
+    }
+    if (!typesOfTypeNodes.has(id)) {
+      typesOfTypeNodes.set(id, checker.getTypeFromTypeNode(node));
+    }
+    return typesOfTypeNodes.get(id);
+  };
   return new Proxy(checker, {
-    get: (target, prop) => (prop === 'getTypeAtLocation' ? getTypeAtLocation : Reflect.get(target, prop, target)),
+    get: (target, prop) =>
+      prop === 'getTypeAtLocation'
+        ? getTypeAtLocation
+        : prop === 'getTypeFromTypeNode'
+        ? getTypeFromTypeNode
+        : Reflect.get(target, prop, target),
   });
 }
