@@ -236,6 +236,11 @@ function withMemoizedTypeAtLocation(checker: any): any {
     return types.get(id);
   };
   return new Proxy(checker, {
-    get: (target, prop) => (prop === 'getTypeAtLocation' ? getTypeAtLocation : Reflect.get(target, prop, target)),
+    get: (target, prop) =>
+      prop === 'getTypeAtLocation'
+        ? getTypeAtLocation
+        : prop === 'primeTypeAtLocation'
+        ? (node: any, type: any) => typeof node?.id === 'string' && types.set(node.id, type)
+        : Reflect.get(target, prop, target),
   });
 }

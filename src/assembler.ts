@@ -285,6 +285,9 @@ export class Assembler {
 
     this._registerModuleExports(moduleExports, moduleSymbol.declarations?.[0]?.path);
 
+    if (process.env.JSII_PROJECT_PREFETCH) {
+      this._prefetchProject();
+    }
     for (const { name, sym, decl, fqn } of this.exported) {
       this._visitNode(name, sym, decl, fqn);
     }
@@ -669,6 +672,19 @@ export class Assembler {
    * the ones the single calls return.
    */
   private _prefetchMethods(members: readonly any[], typeDecl: any): void {
+    const gens = this._methodReads(members, typeDecl);
+    if (gens.length < 2) {
+      return;
+    }
+    try {
+      this.project.api.batch(...gens);
+    } catch {
+      // shortcut: what was read before the failure stays cached (it is what the single calls return); the rest is
+      // read on its own, as before.
+    }
+  }
+
+  private _methodReads(members: readonly any[], typeDecl: any): any[] {
     const { SymbolFlags } = this.ts;
     const { checker, project } = this;
     const decls: any[] = [];
@@ -682,9 +698,6 @@ export class Assembler {
           decls.push(decl);
         }
       }
-    }
-    if (decls.length < 2) {
-      return;
     }
     const signatures = this._signatureCache;
     const returnTypes = this._returnTypeCache;
@@ -703,11 +716,70 @@ export class Assembler {
         }
       }
     }
-    try {
-      project.api.batch(...decls.map(readMethod));
-    } catch {
-      // shortcut: what was read before the failure stays cached (it is what the single calls return); the rest is
-      // read on its own, as before.
+    return decls.map(readMethod);
+  }
+
+  /** Spike: read what `_visitMembers` needs for all exported classes and interfaces in a few large batches. */
+  private _prefetchProject(): void {
+    const { SyntaxKind } = this.ts;
+    const chunk = Number(process.env.JSII_PROJECT_CHUNK ?? 5000);
+    const batch = (gens: any[]): any[] => {
+      const out: any[] = [];
+      for (let i = 0; i < gens.length; i += chunk) {
+        out.push(...this.project.api.batch(...gens.slice(i, i + chunk)));
+      }
+      return out;
+    };
+    const decls = this.exported
+      .map((e) => e.decl)
+      .filter((d) => d?.kind === SyntaxKind.ClassDeclaration || d?.kind === SyntaxKind.InterfaceDeclaration);
+    const types: any[] = [];
+    for (let i = 0; i < decls.length; i += chunk) {
+      types.push(...this.checker.getTypeAtLocation(decls.slice(i, i + chunk)));
+    }
+    decls.forEach((d, i) => this.checker.primeTypeAtLocation?.(d, types[i]));
+    const propLists = batch(types.map((t) => this.checker.getPropertiesOfType.gen(t)));
+    const all = new Set<any>();
+    for (const props of propLists) {
+      for (const p of props ?? []) {
+        all.add(p);
+      }
+    }
+    this._prefetchDocsChunked([...all], chunk);
+    if (process.env.JSII_PROJECT_PREFETCH === '2') {
+      const gens: any[] = [];
+      decls.forEach((d, i) => gens.push(...this._methodReads(propLists[i] ?? [], d)));
+      const { SymbolFlags } = this.ts;
+      const checker = this.checker;
+      const cache = this._typeOfSymbolAtCache;
+      decls.forEach((d, i) => {
+        for (const p of propLists[i] ?? []) {
+          if ((p.flags & SymbolFlags.Method) !== 0) {
+            continue;
+          }
+          const node = p.declarations?.[0]?.resolve(this.project);
+          const owner = node?.kind === SyntaxKind.Parameter ? node.parent?.parent : node?.parent;
+          const key = `${p.id}|${node?.id}`;
+          if (node != null && owner === d && !cache.has(key)) {
+            gens.push(
+              (function* () {
+                cache.set(key, yield* checker.getTypeOfSymbolAtLocation.gen(p, node));
+              })(),
+            );
+          }
+        }
+      });
+      try {
+        batch(gens);
+      } catch {
+        /* spike */
+      }
+    }
+  }
+
+  private _prefetchDocsChunked(syms: any[], chunk: number): void {
+    for (let i = 0; i < syms.length; i += chunk) {
+      this._prefetchDocs(syms.slice(i, i + chunk));
     }
   }
 
